@@ -18,15 +18,18 @@ class query_diverse_loss(nn.Module):
         x = F.normalize(x, dim=-1)
         cos = torch.matmul(x, x.t())
 
-        N_one_hot = torch.zeros((bs, bs))
+        N_one_hot = torch.zeros((bs, bs), device=x.device)
         for i, label in label_dict.items():
-            N_one_hot[label[0]:(label[-1]+1), label[0]:(label[-1]+1)] = torch.ones((len(label), len(label)))
-        N_one_hot = N_one_hot - torch.eye(bs)
-        N_one_hot = N_one_hot.cuda()
+            N_one_hot[label[0]:(label[-1]+1), label[0]:(label[-1]+1)] = torch.ones(
+                (len(label), len(label)), device=x.device
+            )
+        N_one_hot = N_one_hot - torch.eye(bs, device=x.device)
 
         neg_exp = torch.exp(self.alpha * (cos + self.mrg))
+
         N_sim_sum = torch.where(N_one_hot == 1, neg_exp, torch.zeros_like(neg_exp))
         focal = torch.where(N_one_hot == 1, cos, torch.zeros_like(cos))
+
         neg_term = (((1 + focal) ** self.lamda) * torch.log(1 + N_sim_sum)).sum(dim=0).sum() / bs
 
         return neg_term
@@ -38,43 +41,48 @@ class loss(nn.Module):
         self.cfg = cfg
         self.clip_nce_criterion = clip_nce(reduction='mean')
         self.frame_nce_criterion = frame_nce(reduction='mean')
-        self.video_nce_criterion = clip_nce(reduction='mean') 
+        self.video_nce_criterion = clip_nce(reduction='mean')
+
         self.qdl = query_diverse_loss(cfg)
         self.mse_loss = nn.MSELoss(reduction='sum')
-        self.lambda_recon = cfg.get('lambda_recon', 0.0) 
+
+        self.lambda_recon = cfg.get('lambda_recon', 0.0)
 
         triplet_loss_factors = cfg.get('triplet_loss_factor', [1.0, 1.0, 1.0])
         self.lambda_clip_trip = triplet_loss_factors[0]
         self.lambda_frame_trip = triplet_loss_factors[1]
         self.lambda_video_trip = triplet_loss_factors[2]
+        self.last_loss_items = {}
 
     def forward(self, input_list, batch):
         query_labels = batch['text_labels']
-        original_text_feat = batch['text_feat'] 
-        original_frame_video_feat = batch['frame_video_features'] 
-        text_mask = batch['text_mask'] 
-        video_mask = batch['videos_mask'] 
+        original_text_feat = batch['text_feat']
+        original_frame_video_feat = batch['frame_video_features']
+        text_mask = batch['text_mask']
+        video_mask = batch['videos_mask']
 
-        clip_scale_scores = input_list[0] 
-        clip_scale_scores_ = input_list[1] 
+        clip_scale_scores = input_list[0]
+        clip_scale_scores_ = input_list[1]
         label_dict = input_list[2]
         frame_scale_scores = input_list[3]
-        frame_scale_scores_ = input_list[4] 
-        video_scale_scores = input_list[5] 
-        video_scale_scores_unnormalized = input_list[6] 
-        query = input_list[-4] 
-        ot_loss = input_list[-3] 
-        reconstructed_text_feat = input_list[-2] 
-        reconstructed_video_feat = input_list[-1] 
+        frame_scale_scores_ = input_list[4]
+        video_scale_scores = input_list[5]
+        video_scale_scores_unnormalized = input_list[6]
+
+        query = input_list[-4]
+        ot_loss = input_list[-3]
+
+        reconstructed_text_feat = input_list[-2]
+        reconstructed_video_feat = input_list[-1]
 
         clip_nce_loss = self.cfg['loss_factor'][0] * self.clip_nce_criterion(query_labels, label_dict, clip_scale_scores_)
         clip_trip_loss = self.lambda_clip_trip * self.get_clip_triplet_loss(clip_scale_scores, query_labels)
 
         frame_nce_loss = self.cfg['loss_factor'][1] * self.clip_nce_criterion(query_labels, label_dict, frame_scale_scores_)
-        frame_trip_loss = self.lambda_frame_trip * self.get_clip_triplet_loss(frame_scale_scores, query_labels) 
+        frame_trip_loss = self.lambda_frame_trip * self.get_clip_triplet_loss(frame_scale_scores, query_labels)
 
         video_nce_loss = self.cfg['loss_factor'][4] * self.video_nce_criterion(query_labels, label_dict, video_scale_scores_unnormalized)
-        video_trip_loss = self.lambda_video_trip * self.get_clip_triplet_loss(video_scale_scores, query_labels) 
+        video_trip_loss = self.lambda_video_trip * self.get_clip_triplet_loss(video_scale_scores, query_labels)
         qdl_loss = self.cfg['loss_factor'][2] * self.qdl(query, label_dict)
         reconstructed_text_feat_norm = F.normalize(reconstructed_text_feat, dim=-1)
         text_reconstruction_loss = self.mse_loss(
@@ -98,6 +106,23 @@ class loss(nn.Module):
                self.cfg['loss_factor'][3] * ot_loss + \
                self.lambda_recon * total_reconstruction_loss 
 
+        weighted_ot_loss = self.cfg['loss_factor'][3] * ot_loss
+        weighted_reconstruction_loss = self.lambda_recon * total_reconstruction_loss
+        self.last_loss_items = {
+            'clip_nce': float(clip_nce_loss.detach().cpu()),
+            'clip_trip': float(clip_trip_loss.detach().cpu()),
+            'frame_nce': float(frame_nce_loss.detach().cpu()),
+            'frame_trip': float(frame_trip_loss.detach().cpu()),
+            'video_nce': float(video_nce_loss.detach().cpu()),
+            'video_trip': float(video_trip_loss.detach().cpu()),
+            'qdl': float(qdl_loss.detach().cpu()),
+            'ot': float(weighted_ot_loss.detach().cpu()),
+            'recon_text': float(text_reconstruction_loss.detach().cpu()),
+            'recon_video': float(video_reconstruction_loss.detach().cpu()),
+            'recon': float(weighted_reconstruction_loss.detach().cpu()),
+            'total': float(loss.detach().cpu())
+        }
+
         return loss
 
     def get_clip_triplet_loss(self, query_context_scores, labels):
@@ -105,7 +130,6 @@ class loss(nn.Module):
         t2v_scores = query_context_scores
         labels = np.array(labels)
 
-        # cal_v2t_loss
         v2t_loss = 0
         for i in range(v2t_scores.shape[0]):
             pos_indices_v2t = np.where(labels == i)[0]
@@ -127,11 +151,10 @@ class loss(nn.Module):
 
             v2t_loss += (self.cfg['margin'] + sample_neg_pair_scores - pos_pair_scores).clamp(min=0).sum()
 
-        # cal_t2v_loss
         text_indices = torch.arange(t2v_scores.shape[0]).to(t2v_scores.device)
         t2v_pos_scores = t2v_scores[text_indices, labels]
 
-        mask_score = t2v_scores.data 
+        mask_score = t2v_scores.detach().clone()
         mask_score[text_indices, labels] = -float('inf')
         _, sorted_scores_indices = torch.sort(mask_score, descending=True, dim=1)
 
