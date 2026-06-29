@@ -5,15 +5,16 @@ import random
 import numpy as np
 import logging
 
+
 def set_seed(seed, cuda_deterministic=False):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    if cuda_deterministic: 
+    if cuda_deterministic:  # slower, more reproducible
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
-    else:                 
+    else:                   # faster, less reproducible
         torch.backends.cudnn.deterministic = False
         torch.backends.cudnn.benchmark = True
 
@@ -30,7 +31,8 @@ def set_log(file_path, file_name):
     logger.addHandler(handler)
     return logger
 
-def save_ckpt(model, optimizer, config, ckpt_file, epoch, model_val, ema_model=None): 
+
+def save_ckpt(model, optimizer, config, ckpt_file, epoch, model_val, ema_model=None):
     state = {
         'config': config,
         'epoch': epoch,
@@ -38,9 +40,10 @@ def save_ckpt(model, optimizer, config, ckpt_file, epoch, model_val, ema_model=N
         'state_dict': model.state_dict(),
         'optimizer': optimizer.state_dict(),
     }
-    if ema_model is not None: 
+    if ema_model is not None:
         state['ema_shadow'] = ema_model.shadow
     torch.save(state, ckpt_file)
+
 
 def load_ckpt(ckpt_file):
     ckpt = torch.load(ckpt_file, map_location="cpu")
@@ -49,9 +52,10 @@ def load_ckpt(ckpt_file):
     optimizer_state_dict = ckpt['optimizer']
     current_epoch = ckpt['epoch']
     model_val = ckpt['model_val']
-    ema_shadow = ckpt.get('ema_shadow', None) 
+    ema_shadow = ckpt.get('ema_shadow', None)
 
     return config, model_state_dict, optimizer_state_dict, current_epoch, model_val, ema_shadow
+
 
 def gpu(data):
     """
