@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from easydict import EasyDict as edict
-from Models.MTM.model_components import BertAttention, LinearLayer, TrainablePositionalEncoding, DyGMMBlock, BertCrossAttention
+from Models.MTM.model_components import BertAttention, LinearLayer, TrainablePositionalEncoding, DyGMMBlock
 from mamba_ssm import Mamba
 from scipy.optimize import linear_sum_assignment
 
@@ -67,19 +67,223 @@ class AttentionPooling(nn.Module):
 class VideoGuidedTextRefiner(nn.Module):
     def __init__(self, config):
         super(VideoGuidedTextRefiner, self).__init__()
-        self.cross_attention = BertCrossAttention(config) 
-        self.linear_out = LinearLayer(config.hidden_size, config.hidden_size, layer_norm=True, dropout=config.drop, relu=False) 
+        self.hidden_size = config.hidden_size
+        self.safe_residual_scale = float(getattr(config, 'safe_vgtr_residual_scale', 1.0))
+        self.safe_late_weight = float(getattr(config, 'safe_vgtr_late_weight', 0.0))
+        gate_init = float(getattr(config, 'safe_vgtr_gate_init', -5.0))
+        self.residual_gate = nn.Parameter(torch.tensor(gate_init))
+        self.context_score_scale = config.hidden_size ** -0.5
+        self.refine_context_pool_proj = nn.Linear(config.hidden_size, 1)
+        self.context_query_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+        self.context_video_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+        self.pair_gate_proj = nn.Linear(config.hidden_size * 3, 1)
+        self.safe_vgtr_refine_type = getattr(config, 'safe_vgtr_refine_type', 'paper')
+        if self.safe_vgtr_refine_type == 'paper':
+            self.token_text_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+            self.token_context_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+            self.token_score_bias = nn.Parameter(torch.zeros(config.hidden_size))
+            self.token_score_proj = nn.Linear(config.hidden_size, 1, bias=False)
+            self.safe_output_proj = nn.Linear(config.hidden_size, config.hidden_size)
+            self.safe_output_norm = nn.LayerNorm(config.hidden_size)
+            self.token_weight_net = None
+        elif self.safe_vgtr_refine_type == 'mlp':
+            self.token_text_proj = None
+            self.token_context_proj = None
+            self.token_score_bias = None
+            self.token_score_proj = None
+            self.safe_output_proj = None
+            self.safe_output_norm = None
+            self.token_weight_net = nn.Sequential(
+                nn.Linear(config.hidden_size * 3, config.hidden_size),
+                nn.ReLU(inplace=True),
+                nn.Dropout(config.drop),
+                nn.Linear(config.hidden_size, 1)
+            )
+        else:
+            raise ValueError('Unsupported safe_vgtr_refine_type: {}'.format(self.safe_vgtr_refine_type))
 
-    def forward(self, query_feat_2d, video_feat_2d):
-        N_q, D_hidden = query_feat_2d.shape
-        N_v, _ = video_feat_2d.shape
-        query_for_cross_attention = query_feat_2d.unsqueeze(1)
-        video_for_cross_attention = video_feat_2d.unsqueeze(0).expand(N_q, -1, -1)
-        refined_output_3d = self.cross_attention(query_for_cross_attention, video_for_cross_attention, attention_mask=None)
-        refined_output_2d = refined_output_3d.squeeze(1)
-        final_output = self.linear_out(refined_output_2d)
+    def reset_safe_parameters(self):
+        self.pair_gate_proj.weight.data.zero_()
+        if self.pair_gate_proj.bias is not None:
+            self.pair_gate_proj.bias.data.zero_()
 
-        return final_output # (N_q, D_hidden)
+    def refine_context_pool(self, video_sequence_feat, video_mask=None, query_feat=None):
+        """Build candidate context for text-token reweighting.
+
+        When query_feat is provided, the temporal evidence is selected by the
+        current query-candidate pair. This keeps VGTR candidate-adaptive without
+        injecting visual values into the refined query.
+        """
+        if query_feat is None:
+            context_logits = self.refine_context_pool_proj(video_sequence_feat).squeeze(-1)
+        else:
+            query_proj = self.context_query_proj(query_feat).unsqueeze(1)
+            video_proj = self.context_video_proj(video_sequence_feat)
+            context_logits = torch.sum(query_proj * video_proj, dim=-1) * self.context_score_scale
+        if video_mask is not None:
+            valid_mask = video_mask.to(torch.bool)
+            context_logits = context_logits.masked_fill(~valid_mask, -10000.0)
+        context_weights = F.softmax(context_logits, dim=-1)
+        if video_mask is not None:
+            context_weights = context_weights * valid_mask.to(context_weights.dtype)
+            context_weights = context_weights / context_weights.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+        context_feat = torch.sum(video_sequence_feat * context_weights.unsqueeze(-1), dim=1)
+        return context_feat, context_weights
+
+    @staticmethod
+    def _build_pair_indices(n_query, n_video, candidate_indices, device):
+        if candidate_indices is None:
+            query_indices = torch.arange(n_query, device=device).repeat_interleave(n_video)
+            video_indices = torch.arange(n_video, device=device).repeat(n_query)
+            output_shape = (n_query, n_video)
+        else:
+            if candidate_indices.dim() == 1:
+                candidate_indices = candidate_indices.unsqueeze(1)
+            n_candidates = candidate_indices.shape[1]
+            query_indices = torch.arange(n_query, device=device).unsqueeze(1).expand(
+                n_query, n_candidates
+            ).reshape(-1)
+            video_indices = candidate_indices.reshape(-1).to(device)
+            output_shape = (n_query, n_candidates)
+        return query_indices, video_indices, output_shape
+
+    def refine_text_tokens_with_context(self, query_token_feat, query_mask, query_base_feat, video_context_feat):
+        """Refine query embeddings through candidate-conditioned token reweighting."""
+        if self.safe_vgtr_refine_type == 'paper':
+            token_hidden = torch.tanh(
+                self.token_text_proj(query_token_feat) +
+                self.token_context_proj(video_context_feat).unsqueeze(1) +
+                self.token_score_bias.view(1, 1, -1)
+            )
+            token_logits = self.token_score_proj(token_hidden).squeeze(-1)
+        else:
+            video_context = video_context_feat.unsqueeze(1).expand(-1, query_token_feat.shape[1], -1)
+            token_inputs = torch.cat(
+                [query_token_feat, video_context, query_token_feat * video_context],
+                dim=-1
+            )
+            token_logits = self.token_weight_net(token_inputs).squeeze(-1)
+        if query_mask is not None:
+            valid_mask = query_mask.to(torch.bool)
+            token_logits = token_logits.masked_fill(~valid_mask, -10000.0)
+        token_weights = F.softmax(token_logits, dim=-1)
+        if query_mask is not None:
+            token_weights = token_weights * valid_mask.to(token_weights.dtype)
+            token_weights = token_weights / token_weights.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+        reweighted_query = torch.sum(query_token_feat * token_weights.unsqueeze(-1), dim=1)
+        gate_delta = self.pair_gate_proj(
+            torch.cat([query_base_feat, reweighted_query, video_context_feat], dim=-1)
+        ).squeeze(-1)
+        gate = torch.sigmoid(self.residual_gate + gate_delta).unsqueeze(-1)
+        if self.safe_vgtr_refine_type == 'paper':
+            projected_query = self.safe_output_proj(reweighted_query)
+            refined_query = self.safe_output_norm((1.0 - gate) * query_base_feat + gate * projected_query)
+        else:
+            refined_query = query_base_feat + gate * (reweighted_query - query_base_feat)
+        return refined_query, token_weights
+
+    @staticmethod
+    def late_interaction_score(query_token_feat, query_mask, video_sequence_feat, video_mask=None):
+        query_norm = F.normalize(query_token_feat, dim=-1)
+        video_norm = F.normalize(video_sequence_feat, dim=-1)
+        sim = torch.bmm(query_norm, video_norm.transpose(1, 2))
+        if video_mask is not None:
+            video_valid = video_mask.to(torch.bool)
+            sim = sim.masked_fill(~video_valid.unsqueeze(1), -10000.0)
+        token_max = sim.max(dim=2).values
+        if query_mask is not None:
+            query_valid = query_mask.to(torch.bool)
+            token_max = token_max.masked_fill(~query_valid, 0.0)
+            denom = query_valid.to(token_max.dtype).sum(dim=1).clamp_min(1.0)
+            return token_max.sum(dim=1) / denom
+        return token_max.mean(dim=1)
+
+    def score_safe_pairs(
+            self, query_feat_2d, query_token_feat, query_mask, video_global_feat,
+            video_sequence_feat=None, video_mask=None, candidate_indices=None,
+            chunk_size=512, fallback_scores=None
+    ):
+        n_query = query_feat_2d.shape[0]
+        n_video = video_global_feat.shape[0]
+        device = query_feat_2d.device
+        query_indices, video_indices, output_shape = self._build_pair_indices(
+            n_query, n_video, candidate_indices, device
+        )
+
+        pair_count = query_indices.numel()
+        pair_scores = query_feat_2d.new_empty(pair_count)
+        pair_scores_unnormalized = query_feat_2d.new_empty(pair_count)
+        chunk_size = max(1, int(chunk_size))
+
+        if fallback_scores is not None:
+            fallback_norm, fallback_unnorm = fallback_scores
+        else:
+            fallback_norm, fallback_unnorm = None, None
+
+        for start in range(0, pair_count, chunk_size):
+            end = min(start + chunk_size, pair_count)
+            q_idx = query_indices[start:end]
+            v_idx = video_indices[start:end]
+            query_chunk = query_feat_2d[q_idx]
+            query_token_chunk = query_token_feat[q_idx]
+            query_mask_chunk = query_mask[q_idx] if query_mask is not None else None
+            video_match_chunk = video_global_feat[v_idx]
+            video_chunk = None
+            video_mask_chunk = None
+            if video_sequence_feat is not None:
+                video_chunk = video_sequence_feat[v_idx]
+                video_mask_chunk = video_mask[v_idx] if video_mask is not None else None
+                video_context_chunk, _ = self.refine_context_pool(
+                    video_chunk, video_mask_chunk, query_chunk
+                )
+            else:
+                video_context_chunk = video_match_chunk
+
+            refined_query, _ = self.refine_text_tokens_with_context(
+                query_token_chunk,
+                query_mask_chunk,
+                query_chunk,
+                video_context_chunk
+            )
+
+            safe_scores = torch.sum(
+                F.normalize(refined_query, dim=-1) * F.normalize(video_match_chunk, dim=-1),
+                dim=-1
+            )
+            safe_scores_unnormalized = torch.sum(refined_query * video_match_chunk, dim=-1)
+
+            if self.safe_late_weight > 0.0 and video_chunk is not None:
+                late_scores = self.late_interaction_score(
+                    query_token_chunk, query_mask_chunk, video_chunk, video_mask_chunk
+                )
+                safe_scores = safe_scores + self.safe_late_weight * late_scores
+                safe_scores_unnormalized = safe_scores_unnormalized + self.safe_late_weight * late_scores
+
+            if fallback_norm is not None:
+                base_scores = fallback_norm[q_idx, v_idx]
+                base_scores_unnormalized = fallback_unnorm[q_idx, v_idx]
+                pair_scores[start:end] = base_scores + self.safe_residual_scale * (safe_scores - base_scores)
+                pair_scores_unnormalized[start:end] = base_scores_unnormalized + self.safe_residual_scale * (
+                    safe_scores_unnormalized - base_scores_unnormalized
+                )
+            else:
+                pair_scores[start:end] = safe_scores
+                pair_scores_unnormalized[start:end] = safe_scores_unnormalized
+
+        if candidate_indices is None:
+            return pair_scores.view(*output_shape), pair_scores_unnormalized.view(*output_shape)
+
+        if fallback_scores is None:
+            dense_scores = query_feat_2d.new_full((n_query, n_video), -10000.0)
+            dense_scores_unnormalized = query_feat_2d.new_full((n_query, n_video), -10000.0)
+        else:
+            dense_scores, dense_scores_unnormalized = fallback_scores
+            dense_scores = dense_scores.clone()
+            dense_scores_unnormalized = dense_scores_unnormalized.clone()
+
+        dense_scores[query_indices, video_indices] = pair_scores
+        dense_scores_unnormalized[query_indices, video_indices] = pair_scores_unnormalized
+        return dense_scores, dense_scores_unnormalized
 
 class MTM_Net(nn.Module):
     def __init__(self, config):
@@ -118,7 +322,7 @@ class MTM_Net(nn.Module):
             attention_probs_dropout_prob=config.drop
         ))
 
-        # ========= clip =========
+        # Clip-level branch.
         self.clip_input_proj = LinearLayer(
             config.visual_feat_dim, config.hidden_size, 
             layer_norm=True, dropout=config.input_drop, relu=True
@@ -131,6 +335,7 @@ class MTM_Net(nn.Module):
             attention_probs_dropout_prob=config.drop,
             sft_factor=config.sft_factor,
             initializer_range=config.initializer_range,
+            gmm_widths=getattr(config, 'gmm_widths', None),
             map_size=config.map_size
         ))
         clip_mamba_layers = []
@@ -139,7 +344,7 @@ class MTM_Net(nn.Module):
             clip_mamba_layers.append(nn.LayerNorm(config.hidden_size, eps=1e-5))
         self.clip_mamba = nn.ModuleList(clip_mamba_layers)
         
-        # ========= frame =========
+        # Frame-level branch.
         self.frame_input_proj = LinearLayer(
             config.visual_feat_dim, config.hidden_size, 
             layer_norm=True, dropout=config.input_drop, relu=True
@@ -156,6 +361,7 @@ class MTM_Net(nn.Module):
             attention_probs_dropout_prob=config.drop,
             sft_factor=config.sft_factor,
             initializer_range=config.initializer_range,
+            gmm_widths=getattr(config, 'gmm_widths', None),
             map_size=config.max_ctx_l
         ))
         frame_mamba_layers = []
@@ -164,7 +370,7 @@ class MTM_Net(nn.Module):
             frame_mamba_layers.append(nn.LayerNorm(config.hidden_size, eps=1e-5))
         self.frame_mamba = nn.ModuleList(frame_mamba_layers)
 
-        # ========= video =========
+        # Video-level branch.
         self.video_input_proj = LinearLayer(
             config.visual_feat_dim, config.hidden_size, 
             layer_norm=True, dropout=config.input_drop, relu=True
@@ -177,6 +383,7 @@ class MTM_Net(nn.Module):
             attention_probs_dropout_prob=config.drop,
             sft_factor=config.sft_factor,
             initializer_range=config.initializer_range,
+            gmm_widths=getattr(config, 'gmm_widths', None),
             map_size=config.max_ctx_l
         ))
         self.video_pooling = AttentionPooling(config.hidden_size)
@@ -186,7 +393,11 @@ class MTM_Net(nn.Module):
             hidden_dropout_prob=config.drop,
             num_attention_heads=config.n_heads, 
             attention_probs_dropout_prob=config.drop,
-            drop=config.drop 
+            drop=config.drop,
+            safe_vgtr_refine_type=getattr(config, 'safe_vgtr_refine_type', 'paper'),
+            safe_vgtr_gate_init=getattr(config, 'safe_vgtr_gate_init', -5.0),
+            safe_vgtr_residual_scale=getattr(config, 'safe_vgtr_residual_scale', 1.0),
+            safe_vgtr_late_weight=getattr(config, 'safe_vgtr_late_weight', 0.0)
         ))
 
         self.modular_vector_mapping = nn.Linear(config.hidden_size, out_features=1, bias=False)
@@ -219,9 +430,11 @@ class MTM_Net(nn.Module):
             if isinstance(module, nn.Linear) and module.bias is not None:
                 module.bias.data.zero_()
         self.apply(re_init)
+        if hasattr(self.video_guided_text_refinement, 'reset_safe_parameters'):
+            self.video_guided_text_refinement.reset_safe_parameters()
 
     def set_hard_negative(self, use_hard_negative, hard_pool_size):
-        """ 设置是否使用 hard negative """
+        """Update hard-negative mining settings."""
         self.config.use_hard_negative = use_hard_negative
         self.config.hard_pool_size = hard_pool_size
 
@@ -232,14 +445,20 @@ class MTM_Net(nn.Module):
         query_labels    = batch['text_labels']
         frame_video_feat = batch['frame_video_features']     
         frame_video_mask = batch['videos_mask']             
-        encoded_frame_feat, vid_proposal_feat, encoded_video_feat_pooled = self.encode_context(
-            clip_video_feat, frame_video_feat, frame_video_mask
+        encoded_frame_feat, vid_proposal_feat, encoded_video_feat_pooled, encoded_video_sequence = self.encode_context(
+            clip_video_feat, frame_video_feat, frame_video_mask, return_video_sequence=True
         )
-        video_query = self.encode_query(query_feat, query_mask) 
+        encoded_query_tokens = self.encode_query_tokens(query_feat, query_mask)
+        video_query = self.get_modularized_queries(encoded_query_tokens, query_mask)
         clip_scale_scores, clip_scale_scores_, frame_scale_scores, frame_scale_scores_, video_scale_scores, video_scale_scores_ = \
             self.get_pred_from_raw_query(
                 query_feat, query_mask, query_labels,
-                vid_proposal_feat, encoded_frame_feat, encoded_video_feat_pooled, 
+                vid_proposal_feat, encoded_frame_feat, encoded_video_feat_pooled,
+                encoded_video_sequence=encoded_video_sequence,
+                encoded_video_mask=frame_video_mask,
+                encoded_frame_mask=frame_video_mask,
+                precomputed_query=video_query,
+                precomputed_query_tokens=encoded_query_tokens,
                 return_query_feats=True
             )
 
@@ -260,6 +479,7 @@ class MTM_Net(nn.Module):
                 F.normalize(temp_text_emb, dim=-1),
                 F.normalize(temp_clip_emb, dim=-1).t()
             )
+            sim = torch.nan_to_num(sim, nan=0.0, posinf=1.0, neginf=-1.0)
             indices = linear_sum_assignment(sim.detach().cpu())
             q_idx, c_idx = indices
             for i in range(q_idx.shape[0]):
@@ -284,15 +504,18 @@ class MTM_Net(nn.Module):
         ]
 
     def encode_query(self, query_feat, query_mask):
-        encoded_query = self.encode_input(
+        encoded_query = self.encode_query_tokens(query_feat, query_mask)
+        video_query = self.get_modularized_queries(encoded_query, query_mask)
+        return video_query
+
+    def encode_query_tokens(self, query_feat, query_mask):
+        return self.encode_input(
             query_feat, query_mask,
             self.query_input_proj, self.query_encoder,
             self.query_pos_embed
         )
-        video_query = self.get_modularized_queries(encoded_query, query_mask)
-        return video_query
 
-    def encode_context(self, clip_video_feat, frame_video_feat, video_mask=None):
+    def encode_context(self, clip_video_feat, frame_video_feat, video_mask=None, return_video_sequence=False):
         clip_feat = self.clip_input_proj(clip_video_feat)
         clip_feat = self.clip_pos_embed(clip_feat)
         encoded_clip_feat = self.clip_encoder(clip_feat, None, self.weight_token)
@@ -304,17 +527,12 @@ class MTM_Net(nn.Module):
             encoded_clip_feat_m = layer_norm(encoded_clip_feat_m)
         encoded_clip_feat = encoded_clip_feat + encoded_clip_feat_m 
 
-        # -------- frame --------
         frame_feat = self.frame_input_proj(frame_video_feat)
         frame_feat = self.frame_pos_embed(frame_feat)
         frame_feat = self.frame_tcn(frame_feat)
-        attn_mask = video_mask.unsqueeze(1)
+        attn_mask = video_mask.unsqueeze(1) if video_mask is not None else None
         encoded_frame_feat = self.frame_encoder_1(frame_feat, attn_mask, self.weight_token)
-        encoded_frame_feat = torch.where(
-            video_mask.unsqueeze(-1).repeat(1, 1, encoded_frame_feat.shape[-1]) == 1.0,
-            encoded_frame_feat,
-            0.0 * encoded_frame_feat
-        )
+        encoded_frame_feat = self.apply_sequence_mask(encoded_frame_feat, video_mask)
         encoded_frame_feat_m = encoded_frame_feat
         for i in range(0, len(self.frame_mamba), 2): 
             mamba_block = self.frame_mamba[i]
@@ -322,17 +540,22 @@ class MTM_Net(nn.Module):
             encoded_frame_feat_m = mamba_block(encoded_frame_feat_m)
             encoded_frame_feat_m = layer_norm(encoded_frame_feat_m)
         encoded_frame_feat = encoded_frame_feat + encoded_frame_feat_m 
+        encoded_frame_feat = self.apply_sequence_mask(encoded_frame_feat, video_mask)
 
         video_feat_raw = self.video_input_proj(frame_video_feat)
         video_feat_raw = self.video_pos_embed(video_feat_raw)
         encoded_video_sequence = self.video_encoder(video_feat_raw, attn_mask, self.weight_token)
-        encoded_video_sequence = torch.where(
-            video_mask.unsqueeze(-1).repeat(1, 1, encoded_video_sequence.shape[-1]) == 1.0,
-            encoded_video_sequence,
-            0.0 * encoded_video_sequence
-        )
+        encoded_video_sequence = self.apply_sequence_mask(encoded_video_sequence, video_mask)
         encoded_video_feat_pooled = self.video_pooling(encoded_video_sequence, video_mask)
+        if return_video_sequence:
+            return encoded_frame_feat, encoded_clip_feat, encoded_video_feat_pooled, encoded_video_sequence
         return encoded_frame_feat, encoded_clip_feat, encoded_video_feat_pooled
+
+    @staticmethod
+    def apply_sequence_mask(sequence_feat, sequence_mask):
+        if sequence_mask is None:
+            return sequence_feat
+        return sequence_feat * sequence_mask.to(sequence_feat.dtype).unsqueeze(-1)
 
     @staticmethod
     def encode_input(feat, mask, input_proj_layer, encoder_layer, pos_embed_layer, weight_token=None):
@@ -359,37 +582,77 @@ class MTM_Net(nn.Module):
         return modular_queries.squeeze(1) 
 
     @staticmethod
-    def get_clip_scale_scores(modularied_query, context_feat):
+    def get_clip_scale_scores(modularied_query, context_feat, context_mask=None):
         modularied_query = F.normalize(modularied_query, dim=-1)
         context_feat = F.normalize(context_feat, dim=-1)
         clip_level_query_context_scores = torch.matmul(context_feat, modularied_query.t()).permute(2, 1, 0)
+        if context_mask is not None:
+            score_mask = context_mask.to(torch.bool).t().unsqueeze(0)
+            clip_level_query_context_scores = clip_level_query_context_scores.masked_fill(
+                ~score_mask, -float('inf')
+            )
         query_context_scores, _ = torch.max(clip_level_query_context_scores, dim=1)
         return query_context_scores
 
     @staticmethod
-    def get_unnormalized_clip_scale_scores(modularied_query, context_feat):
+    def get_unnormalized_clip_scale_scores(modularied_query, context_feat, context_mask=None):
         query_context_scores = torch.matmul(context_feat, modularied_query.t()).permute(2, 1, 0)
+        if context_mask is not None:
+            score_mask = context_mask.to(torch.bool).t().unsqueeze(0)
+            query_context_scores = query_context_scores.masked_fill(~score_mask, -float('inf'))
         output_query_context_scores, _ = torch.max(query_context_scores, dim=1)
         return output_query_context_scores
 
     def get_pred_from_raw_query(
             self, query_feat, query_mask, query_labels=None,
             video_proposal_feat=None, encoded_frame_feat=None, encoded_video_feat_raw=None,
+            encoded_video_sequence=None, encoded_video_mask=None,
+            encoded_frame_mask=None, precomputed_query=None, precomputed_query_tokens=None,
+            video_candidate_indices=None,
             return_query_feats=False
     ):
-        video_query = self.encode_query(query_feat, query_mask) 
+        query_token_feat = precomputed_query_tokens
+        if precomputed_query is None or query_token_feat is None:
+            query_token_feat = self.encode_query_tokens(query_feat, query_mask)
+        if precomputed_query is None:
+            video_query = self.get_modularized_queries(query_token_feat, query_mask)
+        else:
+            video_query = precomputed_query
         clip_scale_scores = self.get_clip_scale_scores(video_query, video_proposal_feat)
-        frame_scale_scores = self.get_clip_scale_scores(video_query, encoded_frame_feat)
-        refined_text_guided_by_video_representation = self.video_guided_text_refinement(
+        frame_scale_scores = self.get_clip_scale_scores(video_query, encoded_frame_feat, encoded_frame_mask)
+        video_scale_scores_global = self.get_video_scale_scores_from_guided_text(video_query, encoded_video_feat_raw)
+        video_scale_scores_unnormalized_global = self.get_unnormalized_video_scale_scores_from_guided_text(
             video_query, encoded_video_feat_raw)
-        video_scale_scores = self.get_video_scale_scores_from_guided_text(
-            refined_text_guided_by_video_representation, encoded_video_feat_raw)
-        
+
+        if encoded_video_sequence is None:
+            video_scale_scores = video_scale_scores_global
+            video_scale_scores_unnormalized = video_scale_scores_unnormalized_global
+        else:
+            candidate_indices = video_candidate_indices
+            top_k = int(getattr(self.config, 'video_topk', 0))
+            if candidate_indices is None and (not self.training) and top_k > 0 and top_k < video_scale_scores_global.shape[1]:
+                base_scores = (
+                    float(getattr(self.config, 'clip_scale_w', 1.0)) * clip_scale_scores.detach() +
+                    float(getattr(self.config, 'frame_scale_w', 1.0)) * frame_scale_scores.detach()
+                )
+                candidate_indices = torch.topk(base_scores, k=top_k, dim=1).indices
+            video_scale_scores, video_scale_scores_unnormalized = self.video_guided_text_refinement.score_safe_pairs(
+                video_query,
+                query_token_feat,
+                query_mask,
+                encoded_video_feat_raw,
+                video_sequence_feat=encoded_video_sequence,
+                video_mask=encoded_video_mask,
+                candidate_indices=candidate_indices,
+                chunk_size=int(getattr(self.config, 'video_pair_chunk_size', 512)),
+                fallback_scores=(video_scale_scores_global, video_scale_scores_unnormalized_global)
+            )
+
         if return_query_feats:
             clip_scale_scores_ = self.get_unnormalized_clip_scale_scores(video_query, video_proposal_feat)
-            frame_scale_scores_ = self.get_unnormalized_clip_scale_scores(video_query, encoded_frame_feat)
-            video_scale_scores_unnormalized = self.get_unnormalized_video_scale_scores_from_guided_text(
-                refined_text_guided_by_video_representation, encoded_video_feat_raw)
+            frame_scale_scores_ = self.get_unnormalized_clip_scale_scores(
+                video_query, encoded_frame_feat, encoded_frame_mask
+            )
             return clip_scale_scores, clip_scale_scores_, frame_scale_scores, frame_scale_scores_, video_scale_scores, video_scale_scores_unnormalized
         else:
             return clip_scale_scores, frame_scale_scores, video_scale_scores
@@ -406,4 +669,3 @@ class MTM_Net(nn.Module):
 
 def mask_logits(target, mask):
     return target * mask + (1 - mask) * (-1e10)
-
