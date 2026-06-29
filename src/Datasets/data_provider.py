@@ -4,6 +4,7 @@ import numpy as np
 import h5py
 import os
 
+
 def getVideoId(cap_id):
     vid_id = cap_id.split('#')[0]
     return vid_id
@@ -57,9 +58,29 @@ def uniform_feature_sampling(features, max_len):
     new_features = np.asarray(new_features)
     return new_features
 
+
 def l2_normalize_np_array(np_array, eps=1e-5):
     """np_array: np.ndarray, (*, D), where the last dim will be normalized"""
     return np_array / (np.linalg.norm(np_array, axis=-1, keepdims=True) + eps)
+
+
+def load_video_features(video_id, visual_feat, video2frames, map_size, max_ctx_len):
+    frame_list = video2frames[video_id]
+    frame_vecs = []
+    for frame_id in frame_list:
+        frame_vecs.append(visual_feat.read_one(frame_id))
+
+    frame_vecs = np.array(frame_vecs)
+    clip_video_feature = average_to_fixed_length(frame_vecs, map_size)
+    clip_video_feature = l2_normalize_np_array(clip_video_feature)
+    clip_video_feature = torch.from_numpy(clip_video_feature).unsqueeze(0)
+    clip_video_mask = torch.ones(clip_video_feature.shape[1]).unsqueeze(0)
+
+    frame_video_feature = uniform_feature_sampling(frame_vecs, max_ctx_len)
+    frame_video_feature = l2_normalize_np_array(frame_video_feature)
+    frame_video_feature = torch.from_numpy(frame_video_feature)
+    return clip_video_feature, clip_video_mask, frame_video_feature
+
 
 def collate_train(data, cfg):
     """
@@ -67,22 +88,24 @@ def collate_train(data, cfg):
     """
     if data[0][1] is not None:
         data.sort(key=lambda x: len(x[1]), reverse=True)
-    clip_video_features, clip_video_masks, frame_video_features, captions, idxs, cap_ids, video_ids = zip(*data) # 添加 clip_video_masks
+    clip_video_features, clip_video_masks, frame_video_features, captions, idxs, cap_ids, video_ids = zip(*data)
 
     clip_videos = torch.cat(clip_video_features, dim=0).float()
-    clip_videos_mask = torch.cat(clip_video_masks, dim=0).float() 
-    max_ctx_l = cfg['max_ctx_l'] 
+    clip_videos_mask = torch.cat(clip_video_masks, dim=0).float()
+
+    max_ctx_l = cfg['max_ctx_l']
     video_lengths = [len(frame) for frame in frame_video_features]
     frame_vec_len = len(frame_video_features[0][0])
-    frame_videos = torch.zeros(len(frame_video_features), max_ctx_l, frame_vec_len) 
-    videos_mask = torch.zeros(len(frame_video_features), max_ctx_l) 
+    frame_videos = torch.zeros(len(frame_video_features), max_ctx_l, frame_vec_len)
+    videos_mask = torch.zeros(len(frame_video_features), max_ctx_l)
 
     for i, frames in enumerate(frame_video_features):
-        end = min(video_lengths[i], max_ctx_l) 
+        end = min(video_lengths[i], max_ctx_l)
         frame_videos[i, :end, :] = frames[:end, :]
         videos_mask[i, :end] = 1.0
 
     feat_dim = captions[0][0].shape[-1]
+
     merge_captions = []
     all_lengths = []
     labels = []
@@ -104,28 +127,28 @@ def collate_train(data, cfg):
 
     return dict(clip_video_features=clip_videos,
                 clip_video_mask=clip_videos_mask,
-                frame_video_features=frame_videos, 
+                frame_video_features=frame_videos,
                 videos_mask=videos_mask,
                 text_feat=target,
                 text_mask=words_mask,
                 text_labels=labels
                 )
 
+
 def collate_frame_val(data, cfg):
-    clip_video_features, clip_video_masks, frame_video_features, idxs, video_ids = zip(*data) 
+    clip_video_features, clip_video_masks, frame_video_features, idxs, video_ids = zip(*data)
 
     clip_videos = torch.cat(clip_video_features, dim=0).float()
-    clip_videos_mask = torch.cat(clip_video_masks, dim=0).float() 
+    clip_videos_mask = torch.cat(clip_video_masks, dim=0).float()
 
     video_lengths = [len(frame) for frame in frame_video_features]
     frame_vec_len = len(frame_video_features[0][0])
-
     max_len_for_val = cfg['max_ctx_l'] if 'max_ctx_l' in cfg else max(video_lengths)
 
-    frame_videos = torch.zeros(len(frame_video_features), max_len_for_val, frame_vec_len) 
-    videos_mask = torch.zeros(len(frame_video_features), max_len_for_val) 
+    frame_videos = torch.zeros(len(frame_video_features), max_len_for_val, frame_vec_len)
+    videos_mask = torch.zeros(len(frame_video_features), max_len_for_val)
     for i, frames in enumerate(frame_video_features):
-        end = min(video_lengths[i], max_len_for_val) 
+        end = min(video_lengths[i], max_len_for_val)
         frame_videos[i, :end, :] = frames[:end, :]
         videos_mask[i, :end] = 1.0
 
@@ -139,13 +162,12 @@ def collate_text_val(data, cfg):
     if captions[0] is not None:
         lengths = [len(cap) for cap in captions]
         feat_dim = captions[0].shape[-1]
-
         max_len_for_val = cfg['max_desc_l'] if 'max_desc_l' in cfg else max(lengths)
 
-        target = torch.zeros(len(captions), max_len_for_val, feat_dim) 
-        words_mask = torch.zeros(len(captions), max_len_for_val) 
+        target = torch.zeros(len(captions), max_len_for_val, feat_dim)
+        words_mask = torch.zeros(len(captions), max_len_for_val)
         for i, cap in enumerate(captions):
-            end = min(lengths[i], max_len_for_val) 
+            end = min(lengths[i], max_len_for_val)
             target[i, :end] = cap[:end]
             words_mask[i, :end] = 1.0
     else:
@@ -190,45 +212,34 @@ class Dataset4PRVR(data.Dataset):
         self.max_ctx_len = cfg['max_ctx_l']
         self.max_desc_len = cfg['max_desc_l']
 
-        self.text_feat = None 
+        self.text_feat = None
         self.length = len(self.vid_caps)
 
 
     def __getitem__(self, index):
 
-        # Open h5py file only once when it's first accessed
         if self.text_feat is None:
             self.text_feat = h5py.File(self.text_feat_path, 'r')
 
         video_id = self.video_ids[index]
         cap_ids = self.vid_caps[video_id]
 
-        # video
-        frame_list = self.video2frames[video_id]
+        clip_video_feature, clip_video_mask, frame_video_feature = load_video_features(
+            video_id, self.visual_feat, self.video2frames, self.map_size, self.max_ctx_len
+        )
 
-
-        frame_vecs = []
-        for frame_id in frame_list:
-            frame_vecs.append(self.visual_feat.read_one(frame_id))
-
-        clip_video_feature = average_to_fixed_length(np.array(frame_vecs), self.map_size)
-        clip_video_feature = l2_normalize_np_array(clip_video_feature)
-        clip_video_feature = torch.from_numpy(clip_video_feature).unsqueeze(0) # (1, map_size, D)
-        clip_video_mask = torch.ones(clip_video_feature.shape[1]).unsqueeze(0) # (1, map_size)
-
-        frame_video_feature = uniform_feature_sampling(np.array(frame_vecs), self.max_ctx_len)
-        frame_video_feature = l2_normalize_np_array(frame_video_feature)
-        frame_video_feature = torch.from_numpy(frame_video_feature)
-
-        # text
         cap_tensors = []
         for cap_id in cap_ids:
 
             cap_feat = self.text_feat[cap_id][...]
+
             cap_tensor = torch.from_numpy(l2_normalize_np_array(cap_feat))[:self.max_desc_len]
             cap_tensors.append(cap_tensor)
 
-        return clip_video_feature, clip_video_mask, frame_video_feature, cap_tensors, index, cap_ids, video_id
+        return (
+            clip_video_feature, clip_video_mask, frame_video_feature, cap_tensors,
+            index, cap_ids, video_id
+        )
 
     def __len__(self):
         return self.length
@@ -242,25 +253,15 @@ class VisDataSet4PRVR(data.Dataset):
         if video_ids is not None:
             self.video_ids = video_ids
         else:
-            self.video_ids = list(video2frames.keys()) # Ensure it's a list for indexing
+            self.video_ids = list(video2frames.keys())
         self.length = len(self.video_ids)
         self.map_size = cfg['map_size']
         self.max_ctx_len = cfg['max_ctx_l']
     def __getitem__(self, index):
         video_id = self.video_ids[index]
-        frame_list = self.video2frames[video_id]
-        frame_vecs = []
-        for frame_id in frame_list:
-            frame_vecs.append(self.visual_feat.read_one(frame_id))
-        clip_video_feature = average_to_fixed_length(np.array(frame_vecs), self.map_size)
-        clip_video_feature = l2_normalize_np_array(clip_video_feature)
-        clip_video_feature = torch.from_numpy(clip_video_feature).unsqueeze(0) # (1, map_size, D)
-        clip_video_mask = torch.ones(clip_video_feature.shape[1]).unsqueeze(0) # (1, map_size)
-
-
-        frame_video_feature = uniform_feature_sampling(np.array(frame_vecs), self.max_ctx_len)
-        frame_video_feature = l2_normalize_np_array(frame_video_feature)
-        frame_video_feature = torch.from_numpy(frame_video_feature)
+        clip_video_feature, clip_video_mask, frame_video_feature = load_video_features(
+            video_id, self.visual_feat, self.video2frames, self.map_size, self.max_ctx_len
+        )
 
         return clip_video_feature, clip_video_mask, frame_video_feature, index, video_id
 
@@ -283,7 +284,7 @@ class TxtDataSet4PRVR(data.Dataset):
                 self.cap_ids.append(cap_id)
         self.text_feat_path = text_feat_path
         self.max_desc_len = cfg['max_desc_l']
-        self.text_feat = None # Initialize to None, opened when first accessed
+        self.text_feat = None
         self.length = len(self.cap_ids)
 
     def __getitem__(self, index):
