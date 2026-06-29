@@ -218,6 +218,7 @@ class EMA(object):
             if param.requires_grad:
                 assert name in self.shadow
                 param.data = self.original[name]
+        self.original = {}
 
 
 class BertAdam(Optimizer):
@@ -315,7 +316,8 @@ class BertAdam(Optimizer):
                 # In-place operations to update the averages at the same time
                 next_m.mul_(beta1).add_(grad, alpha=1 - beta1)
                 next_v.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
-                update = next_m / (next_v.sqrt() + group['e'])
+                denom = next_v.sqrt().add_(group['e'])
+                update = next_m / denom
 
                 # Just adding the square of the weights to the loss function is *not*
                 # the correct way of using L2 regularization/weight decay with Adam,
@@ -325,13 +327,12 @@ class BertAdam(Optimizer):
                 # with the m/v parameters. This is equivalent to adding the square
                 # of the weights to the loss with plain (non-momentum) SGD.
                 if group['weight_decay'] > 0.0:
-                    update += group['weight_decay'] * p.data
+                    update.add_(p.data, alpha=group['weight_decay'])
 
                 lr_scheduled = group['lr']
                 lr_scheduled *= group['schedule'].get_lr(state['step'])
 
-                update_with_lr = lr_scheduled * update
-                p.data.add_(-update_with_lr)
+                p.data.add_(update, alpha=-lr_scheduled)
 
                 state['step'] += 1
 
