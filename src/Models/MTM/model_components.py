@@ -3,6 +3,22 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+DEFAULT_GMM_WIDTHS = [0.5, 1.0, 5.0, 10.0, 3.0, 0.1, 8.0, 0.05, 2.0, 15.0]
+
+
+def normalize_gmm_widths(widths):
+    if widths is None:
+        return list(DEFAULT_GMM_WIDTHS)
+    if isinstance(widths, str):
+        widths = [item.strip() for item in widths.split(',') if item.strip()]
+    normalized = []
+    for width in widths:
+        if isinstance(width, str) and width.lower() in ['none', 'global']:
+            continue
+        normalized.append(float(width))
+    return normalized
+
+
 class clip_nce(nn.Module):
     def __init__(self, reduction='mean'):
         super(clip_nce, self).__init__()
@@ -103,22 +119,14 @@ class DyGMMBlock(nn.Module):
     def __init__(self, config):
         super(DyGMMBlock, self).__init__()
         self.config = config 
+        self.gmm_widths = normalize_gmm_widths(getattr(config, 'gmm_widths', None))
         self.attn0 = BertAttention(config)
-        self.attn1 = BertAttention(config, wid=0.5)
-        self.attn2 = BertAttention(config, wid=1.0)
-        self.attn3 = BertAttention(config, wid=5.0)
-        self.attn4 = BertAttention(config, wid=10.0)
-        self.attn5 = BertAttention(config, wid=3.0)
-        self.attn6 = BertAttention(config, wid=0.1)
-        self.attn7 = BertAttention(config, wid=8.0)
-        self.attn8 = BertAttention(config, wid=0.05)
-        self.attn9 = BertAttention(config, wid=2)
-        self.attn10 = BertAttention(config, wid=15)
-
-        self.attns = nn.ModuleList([
-            self.attn0, self.attn1, self.attn2, self.attn3, self.attn4, 
-            self.attn5, self.attn6, self.attn7, self.attn8, self.attn9, self.attn10
-        ])
+        attn_modules = [self.attn0]
+        for idx, width in enumerate(self.gmm_widths, start=1):
+            attn_module = BertAttention(config, wid=width)
+            setattr(self, 'attn{}'.format(idx), attn_module)
+            attn_modules.append(attn_module)
+        self.attns = nn.ModuleList(attn_modules)
         
         self.ca = BertCrossAttention(config)
         self.layer1 = nn.Linear(config.hidden_size, config.hidden_size)
@@ -245,11 +253,11 @@ class BertSelfAttention(nn.Module):
         x = x.view(*new_x_shape)
         return x.permute(0, 2, 1, 3)  # (N, nh, L, dh)
 
-    def generate_gauss_weight(self, props_len, width):
+    def generate_gauss_weight(self, props_len, width, device=None, dtype=None):
 
-        center = torch.arange(props_len).cuda() / props_len
-        width = width*torch.ones(props_len).cuda()
-        weight = torch.linspace(0, 1, props_len)
+        center = torch.arange(props_len, device=device, dtype=dtype) / props_len
+        width = width * torch.ones(props_len, device=device, dtype=dtype)
+        weight = torch.linspace(0, 1, props_len, device=device, dtype=dtype)
         weight = weight.view(1, -1).expand(center.size(0), -1).to(center.device)
         center = center.unsqueeze(-1)
         width = width.unsqueeze(-1).clamp(1e-2) / 9
@@ -273,7 +281,10 @@ class BertSelfAttention(nn.Module):
 
         attention_scores = attention_scores_ori
         if self.wid is not None:
-            gmm_mask = self.generate_gauss_weight(attention_scores.shape[-1], self.wid)
+            gmm_mask = self.generate_gauss_weight(
+                attention_scores.shape[-1], self.wid,
+                device=attention_scores.device, dtype=attention_scores.dtype
+            )
             gmm_mask = gmm_mask.unsqueeze(0).unsqueeze(0)
             attention_scores = attention_scores_ori * gmm_mask
         if attention_mask is not None:
@@ -286,4 +297,3 @@ class BertSelfAttention(nn.Module):
         new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,)
         context_layer = context_layer.view(*new_context_layer_shape)
         return context_layer
-
