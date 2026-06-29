@@ -5,7 +5,6 @@ import numpy as np
 import pickle
 import sys, array
 import logging
-import ipdb
 
 class BigFile:
 
@@ -48,7 +47,6 @@ class BigFile:
 
         for next in sorted_index[1:]:
             move = (next - 1 - previous) * offset
-            # print next, move
             fr.seek(move, 1)
             res.fromfile(fr, self.ndims)
             previous = next
@@ -96,13 +94,11 @@ def uniform_feature_sampling(features, max_len):
 
 
 def compute_overlap(pred, gt):
-    # check format
     assert isinstance(pred, list) and isinstance(gt, list)
     pred_is_list = isinstance(pred[0], list)
     gt_is_list = isinstance(gt[0], list)
     pred = pred if pred_is_list else [pred]
     gt = gt if gt_is_list else [gt]
-    # compute overlap
     pred, gt = np.array(pred), np.array(gt)
     inter_left = np.maximum(pred[:, 0, None], gt[None, :, 0])
     inter_right = np.minimum(pred[:, 1, None], gt[None, :, 1])
@@ -111,7 +107,6 @@ def compute_overlap(pred, gt):
     union_right = np.maximum(pred[:, 1, None], gt[None, :, 1])
     union = np.maximum(1e-12, union_right - union_left)
     overlap = 1.0 * inter / union
-    # reformat output
     overlap = overlap if gt_is_list else overlap[:, 0]
     overlap = overlap if pred_is_list else overlap[0]
     return overlap
