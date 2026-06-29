@@ -58,9 +58,9 @@ For this repository, the expected performance is:
 
 | *Dataset* | *R@1* | *R@5* | *R@10* | *R@100* | *SumR* |
 | ---- | ---- | ---- | ---- | ---- | ---- |
-| TVR | 16.0 | 38.4 | 49.2 | 86.8 | 190.4 |
-| ActivityNet Captions | 9.1 | 27.3 | 40.4 | 79.3 | 156.1 |
-| Charades-STA | 2.6 | 9.5 | 14.8 | 54.2 | 81.1 |
+| TVR | 16.0 | 38.4 | 49.6 | 87.2 | 191.2 |
+| ActivityNet Captions | 9.1 | 27.6 | 41.4 | 79.5 | 157.6 |
+| Charades-STA | 2.9 | 9.4 | 15.1 | 54.1 | 81.5 |
 
 [MS-SL]:https://github.com/HuiGuanLab/ms-sl
 
