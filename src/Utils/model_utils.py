@@ -1,8 +1,8 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence\
-import ipdb
+from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
+
 from einops.einops import rearrange
 
 def count_l2_sim(A, B):
@@ -38,7 +38,6 @@ class RNNEncoder(nn.Module):
         self.allow_zero = allow_zero
         self.rnn_type = rnn_type
         self.n_dirs = 2 if bidirectional else 1
-        # - add return_hidden keyword arg to reduce computation if hidden is not needed.
         self.return_hidden = return_hidden
         self.return_outputs = return_outputs
         self.rnn = getattr(nn, rnn_type.upper())(word_embedding_size, hidden_size, n_layers,
@@ -48,7 +47,7 @@ class RNNEncoder(nn.Module):
 
     def sort_batch(self, seq, lengths):
         sorted_lengths, perm_idx = lengths.sort(0, descending=True)
-        if self.allow_zero:  # deal with zero by change it to one.
+        if self.allow_zero:
             sorted_lengths[sorted_lengths == 0] = 1
         reverse_indices = [0] * len(perm_idx)
         for i in range(len(perm_idx)):
@@ -69,12 +68,11 @@ class RNNEncoder(nn.Module):
         packed_inputs = pack_padded_sequence(sorted_inputs, sorted_lengths, batch_first=True)
         outputs, hidden = self.rnn(packed_inputs)
         if self.return_outputs:
-            # outputs, lengths = pad_packed_sequence(outputs, batch_first=True, total_length=int(max(lengths)))
             outputs, lengths = pad_packed_sequence(outputs, batch_first=True)
             outputs = outputs[reverse_indices]
         else:
             outputs = None
-        if self.return_hidden:  #
+        if self.return_hidden:
             if self.rnn_type.lower() == "lstm":
                 hidden = hidden[0]
             hidden = hidden[-self.n_dirs:, :, :]
@@ -100,4 +98,3 @@ def pool_across_time(outputs, lengths, pool_type="max"):
     else:
         raise NotImplementedError("Only support mean and max pooling")
     return torch.stack(outputs, dim=0)
-
